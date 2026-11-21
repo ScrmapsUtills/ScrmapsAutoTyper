@@ -82,6 +82,53 @@ static unsigned number(int id,unsigned lo,unsigned hi){
     wchar_t t[20],*end;GetWindowTextW(control(id),t,20);long v=wcstol(t,&end,10);
     return t[0]&&!*end&&v>=(long)lo&&v<=(long)hi?(unsigned)v:0;
 }
+static wchar_t ini_path[MAX_PATH];
+static int config_ready;
+static const struct {
+    int id, min, max, fallback;
+    const wchar_t *key;
+} options[] = {
+    {HOLD,5,500,80,L"hold_ms"}, {GAP,5,1000,120,L"gap_ms"},
+    {MODE,0,1,0,L"input_mode"}, {ENTERS,0,2,0,L"end_enters"}
+};
+
+static void save_option(unsigned i){
+    int id=options[i].id;
+    int v=(id==MODE||id==ENTERS)
+        ? (int)SendMessageW(control(id),CB_GETCURSEL,0,0)
+        : (int)number(id,options[i].min,options[i].max);
+    if(v<options[i].min||v>options[i].max)return;
+    wchar_t value[16];
+    swprintf(value,16,L"%d",v);
+    if(!WritePrivateProfileStringW(L"typing",options[i].key,value,ini_path))
+        status(L"config.ini에 설정을 저장하지 못했습니다.");
+}
+
+static void load_config(void){
+    wchar_t dir[MAX_PATH];
+    DWORD n=GetEnvironmentVariableW(L"APPDATA",dir,MAX_PATH);
+    if(!n||n+sizeof(L"\\ScrmapsAutoTyper\\config.ini")/sizeof(wchar_t)>MAX_PATH)
+        goto failed;
+    wcscat(dir,L"\\ScrmapsAutoTyper");
+    if(!CreateDirectoryW(dir,NULL)&&GetLastError()!=ERROR_ALREADY_EXISTS)goto failed;
+    wcscpy(ini_path,dir);
+    wcscat(ini_path,L"\\config.ini");
+    int missing=GetFileAttributesW(ini_path)==INVALID_FILE_ATTRIBUTES;
+    for(unsigned i=0;i<sizeof(options)/sizeof(options[0]);i++){
+        wchar_t buf[32],*end;
+        DWORD len=GetPrivateProfileStringW(L"typing",options[i].key,L"",buf,32,ini_path);
+        long v=wcstol(buf,&end,10);
+        if(!len||len>=31||*end||v<options[i].min||v>options[i].max)v=options[i].fallback;
+        int id=options[i].id;
+        if(id==MODE||id==ENTERS)SendMessageW(control(id),CB_SETCURSEL,(WPARAM)v,0);
+        else SetDlgItemInt(app,id,(UINT)v,FALSE);
+        if(missing)save_option(i);
+    }
+    config_ready=1;
+    return;
+failed:
+    status(L"설정 폴더를 열 수 없어 기본값으로 시작합니다.");
+}
 static wchar_t *get_text(size_t *length){
     int n=GetWindowTextLengthW(textbox);
     if(n<=0){*length=0;return NULL;}
@@ -132,35 +179,61 @@ static void tick(void){
     SendMessageW(bar,PBM_SETPOS,(WPARAM)(1000.0*(double)engine.index/(double)plan.count),0);
     if(state!=RUNNING)finish(state);
 }
-static void paste(void){
+static void paste(int replace_all){
     if(!OpenClipboard(app)){status(L"클립보드를 열 수 없어요.");return;}
-    HANDLE h=GetClipboardData(CF_UNICODETEXT);const wchar_t *s=h?GlobalLock(h):NULL;
-    if(s){SIZE_T n=GlobalSize(h)/sizeof(wchar_t);if(n&&wcsnlen(s,n)<n)SetWindowTextW(textbox,s);GlobalUnlock(h);}
+    HANDLE h=GetClipboardData(CF_UNICODETEXT);
+    const wchar_t *src=h?GlobalLock(h):NULL;
+    wchar_t *line=NULL;
+    if(src){
+        size_t cap=GlobalSize(h)/sizeof(*src), n=wcsnlen(src,cap);
+        if(n<cap && (line=malloc((n+1)*sizeof(*line)))){
+            size_t out=0;
+            for(size_t i=0;i<n;i++){
+                wchar_t c=src[i];
+                if(c!=L'\r' && c!=L'\n' && c!=L'\t' && c!=0x2028 && c!=0x2029)
+                    line[out++]=c;
+            }
+            line[out]=0;
+        }
+        GlobalUnlock(h);
+    }
     CloseClipboard();
+    if(line){
+        if(replace_all) SendMessageW(textbox,EM_SETSEL,0,-1);
+        SendMessageW(textbox,EM_REPLACESEL,TRUE,(LPARAM)line);
+        free(line);
+    }
+}
+static LRESULT CALLBACK edit_proc(HWND w,UINT msg,WPARAM wp,LPARAM lp,UINT_PTR id,DWORD_PTR data){
+    (void)data;
+    if(msg==WM_PASTE){paste(0);return 0;}
+    if(msg==WM_NCDESTROY) RemoveWindowSubclass(w,edit_proc,id);
+    return DefSubclassProc(w,msg,wp,lp);
 }
 static void create_ui(void){
     add(L"STATIC",L"AUTO TYPER",0,26,20,760,45,0,titlefont);
     label(L"붙여넣은 내용을 원하는 입력창에 한 글자씩 입력합니다.  F8 시작 / F9 중단",26,74,790,30);
     button(L"붙여넣기",26,114,140,PASTE);button(L"내용 지우기",178,114,130,CLEAR);
     add(L"STATIC",L"0자",SS_RIGHT,450,121,360,26,COUNT,NULL);
-    textbox=add(L"EDIT",L"",WS_BORDER|WS_TABSTOP|WS_VSCROLL|WS_HSCROLL|ES_MULTILINE|ES_AUTOVSCROLL|ES_AUTOHSCROLL|ES_WANTRETURN,26,164,784,232,TEXT,codefont);
+    textbox=add(L"EDIT",L"",WS_BORDER|WS_TABSTOP|ES_AUTOHSCROLL,26,164,360,32,TEXT,codefont);
+    SetWindowSubclass(textbox,edit_proc,1,0);
     SendMessageW(textbox,EM_SETLIMITTEXT,0x7ffffffe,0);
-    label(L"키 누름 (ms)",26,419,130,26);add(L"EDIT",L"80",WS_BORDER|ES_NUMBER|WS_TABSTOP,160,412,90,34,HOLD,NULL);
-    label(L"키 사이 대기 (ms)",290,419,170,26);add(L"EDIT",L"120",WS_BORDER|ES_NUMBER|WS_TABSTOP,465,412,90,34,GAP,NULL);
-    label(L"입력 방식",26,464,350,25);label(L"끝에 Enter 추가",410,464,300,25);
-    HWND mode=add(L"COMBOBOX",L"",CBS_DROPDOWNLIST|WS_TABSTOP,26,493,360,150,MODE,NULL);
+    label(L"키 누름 (ms)",26,223,130,26);add(L"EDIT",L"80",WS_BORDER|ES_NUMBER|WS_TABSTOP,160,216,90,34,HOLD,NULL);
+    label(L"키 사이 대기 (ms)",290,223,170,26);add(L"EDIT",L"120",WS_BORDER|ES_NUMBER|WS_TABSTOP,465,216,90,34,GAP,NULL);
+    label(L"입력 방식",26,268,350,25);label(L"끝에 Enter 추가",410,268,300,25);
+    HWND mode=add(L"COMBOBOX",L"",CBS_DROPDOWNLIST|WS_TABSTOP,26,297,360,150,MODE,NULL);
     SendMessageW(mode,CB_ADDSTRING,0,(LPARAM)L"일반 텍스트 (한글·기호 포함)");SendMessageW(mode,CB_ADDSTRING,0,(LPARAM)L"키보드 입력 (게임·영문 기호)");SendMessageW(mode,CB_SETCURSEL,0,0);
-    HWND enter=add(L"COMBOBOX",L"",CBS_DROPDOWNLIST|WS_TABSTOP,410,493,180,150,ENTERS,NULL);
+    HWND enter=add(L"COMBOBOX",L"",CBS_DROPDOWNLIST|WS_TABSTOP,410,297,180,150,ENTERS,NULL);
     SendMessageW(enter,CB_ADDSTRING,0,(LPARAM)L"누르지 않음");SendMessageW(enter,CB_ADDSTRING,0,(LPARAM)L"1번");SendMessageW(enter,CB_ADDSTRING,0,(LPARAM)L"2번");SendMessageW(enter,CB_SETCURSEL,0,0);
-    button(L"3초 후 입력",26,549,240,START);button(L"중단 (F9)",282,549,160,STOP);EnableWindow(control(STOP),FALSE);
-    statusbox=add(L"STATIC",L"내용을 붙여넣고, 입력할 창을 클릭한 다음 F8을 누르세요.",0,26,606,784,45,STATUS,NULL);
-    bar=add(PROGRESS_CLASSW,L"",0,26,660,784,10,PROGRESS,NULL);SendMessageW(bar,PBM_SETRANGE32,0,1000);
-    label(L"줄바꿈·탭은 Enter·Tab 키로 입력됩니다. 마지막 Enter는 기본으로 추가하지 않습니다.",26,684,784,26);
+    button(L"3초 후 입력",26,353,240,START);button(L"중단 (F9)",282,353,160,STOP);EnableWindow(control(STOP),FALSE);
+    statusbox=add(L"STATIC",L"내용을 붙여넣고, 입력할 창을 클릭한 다음 F8을 누르세요.",0,26,410,784,45,STATUS,NULL);
+    bar=add(PROGRESS_CLASSW,L"",0,26,464,784,10,PROGRESS,NULL);SendMessageW(bar,PBM_SETRANGE32,0,1000);
+    label(L"붙여넣으면 줄바꿈과 탭을 제거해 한 줄로 합칩니다.",26,488,784,26);
 }
 static LRESULT CALLBACK proc(HWND w,UINT msg,WPARAM wp,LPARAM lp){
     switch(msg){
     case WM_CREATE:
-        app=w;create_ui();hot8=RegisterHotKey(w,1,MOD_NOREPEAT,VK_F8);hot9=RegisterHotKey(w,2,MOD_NOREPEAT,VK_F9);
+        app=w;create_ui();load_config();hot8=RegisterHotKey(w,1,MOD_NOREPEAT,VK_F8);hot9=RegisterHotKey(w,2,MOD_NOREPEAT,VK_F9);
         if(!hot8)status(L"F8을 다른 프로그램이 사용 중입니다. '3초 후 입력' 버튼을 사용하세요.");
         else if(!hot9)status(L"F9을 다른 프로그램이 사용 중입니다. 창을 전환해 중단할 수 있습니다.");
         return 0;
@@ -170,9 +243,16 @@ static LRESULT CALLBACK proc(HWND w,UINT msg,WPARAM wp,LPARAM lp){
         return 0;
     case WM_TIMER:if(wp==1)tick();return 0;
     case WM_COMMAND:
+        if(config_ready){
+            for(unsigned i=0;i<sizeof(options)/sizeof(options[0]);i++){
+                int id=options[i].id;
+                int event=(id==MODE||id==ENTERS)?CBN_SELCHANGE:EN_CHANGE;
+                if(LOWORD(wp)==id&&HIWORD(wp)==event){save_option(i);break;}
+            }
+        }
         if(LOWORD(wp)==TEXT&&HIWORD(wp)==EN_CHANGE){wchar_t t[100];_snwprintf(t,100,L"%d자",GetWindowTextLengthW(textbox));SetWindowTextW(control(COUNT),t);}
         if(HIWORD(wp)==BN_CLICKED)switch(LOWORD(wp)){
-        case PASTE:paste();break;
+        case PASTE:paste(1);break;
         case CLEAR:SetWindowTextW(textbox,L"");break;
         case START:request_start(1);break;
         case STOP:stop_typing(&engine,CANCELLED,emit,NULL);finish(CANCELLED);break;
@@ -203,7 +283,7 @@ int WINAPI wWinMain(HINSTANCE instance,HINSTANCE previous,PWSTR cmd,int show){
     INITCOMMONCONTROLSEX cc={sizeof(cc),ICC_PROGRESS_CLASS};InitCommonControlsEx(&cc);
     WNDCLASSW cls={0};cls.lpfnWndProc=proc;cls.hInstance=instance;cls.lpszClassName=L"AutoTyperWindow";cls.hCursor=LoadCursorW(NULL,IDC_ARROW);cls.hbrBackground=background;cls.hIcon=LoadIconW(NULL,IDI_APPLICATION);
     if(!RegisterClassW(&cls))return 1;
-    DWORD style=WS_OVERLAPPED|WS_CAPTION|WS_SYSMENU|WS_MINIMIZEBOX;RECT r={0,0,scale(836),scale(722)};AdjustWindowRect(&r,style,FALSE);
+    DWORD style=WS_OVERLAPPED|WS_CAPTION|WS_SYSMENU|WS_MINIMIZEBOX;RECT r={0,0,scale(836),scale(526)};AdjustWindowRect(&r,style,FALSE);
     HWND w=CreateWindowW(cls.lpszClassName,L"자동 타이핑 1.1",style,CW_USEDEFAULT,CW_USEDEFAULT,r.right-r.left,r.bottom-r.top,NULL,NULL,instance,NULL);
     if(!w)return 1;
     ShowWindow(w,show);UpdateWindow(w);MSG m;int result;
